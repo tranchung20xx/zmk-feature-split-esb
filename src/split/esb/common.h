@@ -7,12 +7,16 @@
 #pragma once
 
 #include <zephyr/sys/ring_buffer.h>
+#include <zephyr/sys/util.h>
 #include <zephyr/device.h>
 
 #include <zmk/split/transport/types.h>
 #include "app_esb.h"
 
 #define ZMK_SPLIT_ESB_ENVELOPE_MAGIC_PREFIX "ZmKe"
+
+#define ESB_SOURCE_KEY_STATE_FLAG BIT(7)
+#define ESB_KEY_STATE_LEN 16
 
 struct esb_msg_prefix {
     uint8_t magic_prefix[sizeof(ZMK_SPLIT_ESB_ENVELOPE_MAGIC_PREFIX) - 1];
@@ -37,6 +41,16 @@ struct esb_event_payload {
 struct esb_event_envelope {
     struct esb_msg_prefix prefix;
     struct esb_event_payload payload;
+} __packed;
+
+struct esb_key_state_payload {
+    uint8_t source;
+    uint8_t state[ESB_KEY_STATE_LEN];
+} __packed;
+
+struct esb_key_state_envelope {
+    struct esb_msg_prefix prefix;
+    struct esb_key_state_payload payload;
 } __packed;
 
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_MSG_POSTFIX_CRC)

@@ -30,12 +30,14 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_SPLIT_ESB_LOG_LEVEL);
 #include "app_esb.h"
 #include "common.h"
 
+#define MAX_EVENT_ENV_SIZE MAX(sizeof(struct esb_event_envelope), sizeof(struct esb_key_state_envelope))
+
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_MSG_POSTFIX_CRC)
 #define TX_BUFFER_SIZE (sizeof(struct esb_command_envelope) + sizeof(struct esb_msg_postfix))
-#define RX_BUFFER_SIZE (sizeof(struct esb_event_envelope) + sizeof(struct esb_msg_postfix))
+#define RX_BUFFER_SIZE (MAX_EVENT_ENV_SIZE + sizeof(struct esb_msg_postfix))
 #else
 #define TX_BUFFER_SIZE (sizeof(struct esb_command_envelope))
-#define RX_BUFFER_SIZE (sizeof(struct esb_event_envelope))
+#define RX_BUFFER_SIZE (MAX_EVENT_ENV_SIZE)
 #endif
 
 RING_BUF_DECLARE(tx_buf, TX_BUFFER_SIZE * CONFIG_ZMK_SPLIT_ESB_CMD_BUFFER_ITEMS);
@@ -213,50 +215,102 @@ SYS_INIT(zmk_split_esb_central_init, APPLICATION, CONFIG_KERNEL_INIT_PRIORITY_DE
 
 extern const struct zmk_split_transport_central *active_transport;
 
+#define MAX_PERIPHERALS 16
+
+static uint8_t peripheral_position_state[MAX_PERIPHERALS][ESB_KEY_STATE_LEN];
+
+static void process_key_state(uint8_t source, const uint8_t *new_state) {
+    if (&esb_central != active_transport) {
+        return;
+    }
+    if (source >= MAX_PERIPHERALS) {
+        LOG_WRN("Source %d exceeds MAX_PERIPHERALS", source);
+        return;
+    }
+
+    uint8_t changed[ESB_KEY_STATE_LEN];
+    for (int i = 0; i < ESB_KEY_STATE_LEN; i++) {
+        changed[i] = new_state[i] ^ peripheral_position_state[source][i];
+        peripheral_position_state[source][i] = new_state[i];
+    }
+
+    for (int i = 0; i < ESB_KEY_STATE_LEN; i++) {
+        if (!changed[i]) {
+            continue;
+        }
+        for (int j = 0; j < 8; j++) {
+            if (changed[i] & BIT(j)) {
+                uint32_t position = (i * 8) + j;
+                bool pressed = (new_state[i] & BIT(j)) != 0;
+
+                struct zmk_split_transport_peripheral_event ev = {
+                    .type = ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_KEY_POSITION_EVENT,
+                    .data = {
+                        .key_position_event = {
+                            .position = position,
+                            .pressed = pressed,
+                        }
+                    }
+                };
+
+                zmk_split_transport_central_peripheral_event_handler(
+                    &esb_central, source, ev);
+            }
+        }
+    }
+}
+
 static void process_rx_work_cb(struct k_work *work) {
     for (int pipe = 0; pipe < CONFIG_ESB_PIPE_COUNT; pipe++) {
         struct ring_buf *rx_buf = &state.rx_bufs[pipe];
         while (ring_buf_size_get(rx_buf) > ESB_MSG_EXTRA_SIZE) {
-            struct esb_event_envelope env;
-            int item_err = zmk_split_esb_get_item(rx_buf, (uint8_t *)&env, 
-                                                  sizeof(struct esb_event_envelope));
+            union {
+                struct esb_msg_prefix prefix;
+                struct esb_event_envelope event_env;
+                struct esb_key_state_envelope key_state_env;
+            } env;
+            int item_err = zmk_split_esb_get_item(rx_buf, (uint8_t *)&env, sizeof(env));
             switch (item_err) {
-            case 0:
-                if (&esb_central == active_transport) {
+            case 0: {
+                uint8_t raw_source = env.event_env.payload.source;
+                if (raw_source & ESB_SOURCE_KEY_STATE_FLAG) {
+                    uint8_t clean_source = raw_source & ~ESB_SOURCE_KEY_STATE_FLAG;
+                    process_key_state(clean_source, env.key_state_env.payload.state);
+                } else {
+                    if (&esb_central == active_transport) {
+                        static uint8_t key_pos_states[(CONFIG_ZMK_SPLIT_ESB_AUTO_HEAL_KEY_POS_MAX + 8) / 8];
+                        struct zmk_split_transport_peripheral_event ev = env.event_env.payload.event;
 
-                    static uint8_t key_pos_states[(CONFIG_ZMK_SPLIT_ESB_AUTO_HEAL_KEY_POS_MAX + 8) / 8];
-                    struct zmk_split_transport_peripheral_event ev = env.payload.event;
+                        if (ev.type == ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_KEY_POSITION_EVENT) {
+                            uint8_t pressed = ev.data.key_position_event.pressed;
+                            uint8_t position = ev.data.key_position_event.position;
 
-                    if (ev.type == ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_KEY_POSITION_EVENT) {
-
-                        uint8_t pressed = ev.data.key_position_event.pressed;
-                        uint8_t position = ev.data.key_position_event.position;
-
-                        if (position < CONFIG_ZMK_SPLIT_ESB_AUTO_HEAL_KEY_POS_MAX) {
-                            if (pressed) {
-                                if ((key_pos_states[position / 8] >> (position % 8)) & 1) {
-                                    LOG_WRN("re-pressing detected, inject release event");
-                                    struct zmk_position_state_changed state_ev = {
-                                        .source = env.payload.source,
-                                        .position = position,
-                                        .state = !pressed,
-                                        .timestamp = k_uptime_get()
-                                    };
-                                    raise_zmk_position_state_changed(state_ev);
-                                    k_sleep(K_MSEC(1));
+                            if (position < CONFIG_ZMK_SPLIT_ESB_AUTO_HEAL_KEY_POS_MAX) {
+                                if (pressed) {
+                                    if ((key_pos_states[position / 8] >> (position % 8)) & 1) {
+                                        LOG_WRN("re-pressing detected, inject release event");
+                                        struct zmk_position_state_changed state_ev = {
+                                            .source = env.event_env.payload.source,
+                                            .position = position,
+                                            .state = !pressed,
+                                            .timestamp = k_uptime_get()
+                                        };
+                                        raise_zmk_position_state_changed(state_ev);
+                                        k_sleep(K_MSEC(1));
+                                    }
+                                    key_pos_states[position / 8] |= 1 << (position % 8);
+                                } else {
+                                    key_pos_states[position / 8] &= ~(1 << (position % 8));
                                 }
-                                key_pos_states[position / 8] |= 1 << (position % 8);
-                            } else {
-                                key_pos_states[position / 8] &= ~(1 << (position % 8));
                             }
                         }
 
+                        zmk_split_transport_central_peripheral_event_handler(
+                            &esb_central, env.event_env.payload.source, env.event_env.payload.event);
                     }
                 }
-
-                zmk_split_transport_central_peripheral_event_handler(
-                    &esb_central, env.payload.source, env.payload.event);
                 break;
+            }
             case -EAGAIN:
                 break;
             case -EINVAL:

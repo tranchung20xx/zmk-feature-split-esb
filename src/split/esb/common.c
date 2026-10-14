@@ -15,55 +15,61 @@
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_SPLIT_ESB_LOG_LEVEL);
 
 void zmk_split_esb_tx(struct zmk_split_esb_state *state) {
-    size_t tx_buf_len = ring_buf_size_get(state->tx_buf);
-    // LOG_DBG("tx_buf_len %u, CONFIG_ESB_MAX_PAYLOAD_LENGTH %u", 
-    //         tx_buf_len, CONFIG_ESB_MAX_PAYLOAD_LENGTH);
-    if (!tx_buf_len || tx_buf_len > CONFIG_ESB_MAX_PAYLOAD_LENGTH) {
-        return;
-    }
-    // Need at least prefix + postfix + meta
-    if (tx_buf_len < (sizeof(struct esb_msg_prefix) 
+    while (ring_buf_size_get(state->tx_buf) >= (sizeof(struct esb_msg_prefix) 
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_MSG_POSTFIX_CRC)
-    + sizeof(struct esb_msg_postfix) 
+        + sizeof(struct esb_msg_postfix) 
 #endif
-    + sizeof(struct esb_msg_meta)
-    )) {
-        return;
-    }
-    // LOG_DBG("tx_buf_len: %d", tx_buf_len);
+        + sizeof(struct esb_msg_meta))) {
 
-    uint8_t buf[CONFIG_ESB_MAX_PAYLOAD_LENGTH];
-    size_t claim_len = 0;
-    while (claim_len < tx_buf_len) {
-        uint8_t *b;
-        uint32_t buf_len = ring_buf_get_claim(state->tx_buf, &b, tx_buf_len - claim_len);
-        if (buf_len <= 0) {
+        struct esb_msg_prefix prefix;
+        if (ring_buf_peek(state->tx_buf, (uint8_t *)&prefix, sizeof(prefix)) != sizeof(prefix)) {
             break;
         }
-        memcpy(&buf[claim_len], b, buf_len);
-        claim_len += buf_len;
+
+        if (memcmp(&prefix.magic_prefix, &ZMK_SPLIT_ESB_ENVELOPE_MAGIC_PREFIX,
+                   sizeof(prefix.magic_prefix)) != 0) {
+            LOG_WRN("TX prefix mismatch, skipping 1 byte");
+            uint8_t dummy;
+            ring_buf_get(state->tx_buf, &dummy, 1);
+            continue;
+        }
+
+        size_t ota_len = sizeof(prefix) + prefix.payload_size
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_MSG_POSTFIX_CRC)
+            + sizeof(struct esb_msg_postfix)
+#endif
+            ;
+        size_t total_item_len = ota_len + sizeof(struct esb_msg_meta);
+
+        if (ring_buf_size_get(state->tx_buf) < total_item_len) {
+            break;
+        }
+
+        if (ota_len > CONFIG_ESB_MAX_PAYLOAD_LENGTH) {
+            LOG_ERR("Item length %u exceeds CONFIG_ESB_MAX_PAYLOAD_LENGTH %u", ota_len, CONFIG_ESB_MAX_PAYLOAD_LENGTH);
+            ring_buf_reset(state->tx_buf);
+            break;
+        }
+
+        uint8_t buf[CONFIG_ESB_MAX_PAYLOAD_LENGTH + sizeof(struct esb_msg_meta)];
+        uint32_t read_bytes = ring_buf_get(state->tx_buf, buf, total_item_len);
+        if (read_bytes != total_item_len) {
+            LOG_ERR("Failed to read complete item from tx_buf (%u vs %u)", read_bytes, total_item_len);
+            break;
+        }
+
+        struct esb_msg_meta meta;
+        memcpy(&meta, &buf[ota_len], sizeof(meta));
+
+        app_esb_data_t tx_data = {
+            .pipe = state->tx_pipe,
+            .data = buf,
+            .len = ota_len,
+            .msg_id = meta.msg_id,
+            .max_retry = meta.max_retry
+        };
+        zmk_split_esb_send(&tx_data);
     }
-    if (claim_len <= 0) {
-        return;
-    }
-    // LOG_DBG("tx_buf_len: %d, claim_len: %d", tx_buf_len, claim_len);
-    // LOG_HEXDUMP_DBG(buf, claim_len, "buf");
-
-    size_t meta_offset = claim_len - sizeof(struct esb_msg_meta);
-    struct esb_msg_meta meta;
-    memcpy(&meta, &buf[meta_offset], sizeof(meta));
-
-    app_esb_data_t tx_data = {
-        .pipe = state->tx_pipe,
-        .data = buf,
-        .len = meta_offset,
-        .msg_id = meta.msg_id,
-        .max_retry = meta.max_retry
-    };
-    zmk_split_esb_send(&tx_data); // callback > zmk_split_esb_cb()
-
-    // LOG_DBG("ESB TX Buf finish %d", claim_len);
-    ring_buf_get_finish(state->tx_buf, claim_len);
 }
 
 static K_SEM_DEFINE(esb_cb_sem, 1, 1);
@@ -113,7 +119,6 @@ void zmk_split_esb_cb(app_esb_event_t *event, struct zmk_split_esb_state *state)
 }
 
 int zmk_split_esb_get_item(struct ring_buf *rx_buf, uint8_t *env, size_t env_size) {
-    // RX buffer only has prefix + postfix
     while (ring_buf_size_get(rx_buf) > (sizeof(struct esb_msg_prefix) 
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_MSG_POSTFIX_CRC)
             + sizeof(struct esb_msg_postfix)
@@ -128,15 +133,9 @@ int zmk_split_esb_get_item(struct ring_buf *rx_buf, uint8_t *env, size_t env_siz
 
         if (memcmp(&prefix.magic_prefix, &ZMK_SPLIT_ESB_ENVELOPE_MAGIC_PREFIX,
                    sizeof(prefix.magic_prefix)) != 0) {
-            LOG_WRN("Multiple prefix mismatches, resetting buffer");
-            ring_buf_reset(rx_buf);
-
-            // // LOG_WRN("Prefix mismatch, skipping 1 byte to realign");
-            // // Drop a single byte to let the stream re-align
-            // uint8_t dummy;
-            // ring_buf_get(rx_buf, &dummy, 1);
-
-            return -EINVAL;
+            uint8_t dummy;
+            ring_buf_get(rx_buf, &dummy, 1);
+            continue;
         }
 
         size_t payload_to_read = sizeof(prefix) + prefix.payload_size;
@@ -144,8 +143,9 @@ int zmk_split_esb_get_item(struct ring_buf *rx_buf, uint8_t *env, size_t env_siz
         if (payload_to_read > env_size) {
             LOG_WRN("Invalid message with payload %d bigger than expected max %d", 
                 payload_to_read, env_size);
-            ring_buf_reset(rx_buf);
-            return -EINVAL;
+            uint8_t dummy;
+            ring_buf_get(rx_buf, &dummy, 1);
+            continue;
         }
 
         if (ring_buf_size_get(rx_buf) < (payload_to_read 
@@ -169,12 +169,10 @@ int zmk_split_esb_get_item(struct ring_buf *rx_buf, uint8_t *env, size_t env_siz
                       read == sizeof(postfix),
                       "Somehow read less of the postfix than we expect from the RX buffer");
 
-        // LOG_HEXDUMP_DBG(&postfix, sizeof(postfix), "postfix");
-
         uint32_t crc = crc32_ieee(env, payload_to_read);
 
         if (crc != postfix.crc) {
-            LOG_WRN("Data corruption in received peripheral event, resetting buffer (%d vs %d)",
+            LOG_WRN("Data corruption in received peripheral event, skipping (%d vs %d)",
                     crc, postfix.crc);
             return -EINVAL;
         }
