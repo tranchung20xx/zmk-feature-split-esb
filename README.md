@@ -4,6 +4,57 @@ This is a [ZMK](https://zmk.dev) *Split Transport* module adding support for [En
 
 This work is based on [zmk,wired-split](https://github.com/zmkfirmware/zmk/tree/main/app/src/split/wired), [nRF Connect SDK > ESB Examples](https://docs.nordicsemi.com/bundle/ncs-2.6.4/page/nrf/samples/esb.html) and [ncs-esb-ble-mpsl-demo](https://github.com/too1/ncs-esb-ble-mpsl-demo/).
 
+> [!IMPORTANT]
+> ### 🛡️ Fork Notice & Production Fixes (by [@tranchung20xx](https://github.com/tranchung20xx))
+> This fork includes critical stability and latency improvements over the original proof-of-concept. It addresses root causes of **stuck keys, continuous repeating keys, airborne packet collisions during modifier holding (e.g. Emacs / gaming), and radio FIFO corruption**.
+>
+> If you are building or using this fork, please read the [Important Configuration Warnings](#-important-configuration-warnings--how-to-avoid-stuck-keys) below.
+
+---
+
+## ⚠️ Important Configuration Warnings & How to Avoid Stuck Keys
+
+If you are using this ESB split transport with a central USB dongle (Dongle PRX + 2x Keyboard PTX):
+
+1. **DISABLE Channel Hopping in Star Networks (`CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP=n`)**:
+   - In a multi-node star network without synchronized frequency hopping timeslots, independent channel hopping **will break the link**. If Central or a peripheral hops frequencies unilaterally upon packet loss, nodes become stranded on different channels, causing dropped keystrokes and infinite key repeats.
+   - **Always set `CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP=n`** on Dongle and Peripherals.
+
+2. **Lock to Clean Guard-Band Channel 76 (`CONFIG_ZMK_SPLIT_ESB_DEFAULT_RF_CHANNEL=76`)**:
+   - The default channel 2 (2402 MHz) directly collides with BLE Advertising Channel 37 and Wi-Fi Channel 1.
+   - Channel 76 (2476 MHz) sits in the quiet guard band **above Wi-Fi Channel 11 (max 2473.5 MHz)** and **below BLE Advertising Channel 39 (2480 MHz)**.
+   - Set `CONFIG_ZMK_SPLIT_ESB_DEFAULT_RF_CHANNEL=76` on Dongle and both Peripherals.
+
+3. **Stagger Hardware Retransmission Delays**:
+   - If both halves transmit at the exact same instant, identical retransmission delays cause repeating on-air collisions.
+   - Set different delays on each half in your shield configuration:
+     - **Left Half** (`corne_left.conf`): `CONFIG_ZMK_SPLIT_ESB_PROTO_TX_RETRANSMIT_DELAY=500` (500 µs)
+     - **Right Half** (`corne_right.conf`): `CONFIG_ZMK_SPLIT_ESB_PROTO_TX_RETRANSMIT_DELAY=750` (750 µs)
+     - **Dongle** (`corne_dongle.conf`): `CONFIG_ZMK_SPLIT_ESB_PROTO_TX_RETRANSMIT_DELAY=600` (600 µs)
+
+---
+
+## 🛠️ Key Architectural Fixes in this Fork
+
+### 1. Idempotent Key-State Bitmap Protocol
+- **Old Behavior**: Peripherals sent discrete `KeyDown` and `KeyUp` events. If a single `KeyUp` packet was dropped by RF noise, Central never knew the key was released, leaving it stuck down forever on the host OS.
+- **New Behavior**: Peripherals maintain a full key-state bitmap (`struct esb_key_state_envelope`). Every packet carries the complete state of all keys on that half. Central compares incoming bitmaps in two strict passes: **Pass 1 processes all releases first**, then **Pass 2 processes presses**. Any subsequent keystroke or confirmation immediately self-heals any previously lost state.
+
+### 2. Redundant Release Confirmation Flush
+- When all keys are released (`0000...`), the peripheral sends the release state immediately with maximum retries, then automatically schedules a **redundant confirmation packet 20 ms later**. This ensures Central receives the release state even under harsh RF interference.
+
+### 3. Elimination of Modifier Hold Packet Flooding (The Emacs/Gaming Fix)
+- **Old Behavior**: While holding a key (e.g. `Ctrl`, `Alt`, or `W`), a 100 ms keep-alive timer repeatedly blasted packets over the air. Holding `Ctrl` on the left half while pressing keys on the right half caused frequent on-air collisions and triggered premature Central watchdog timeouts.
+- **New Behavior**: The 100 ms keep-alive during active holds was removed. Once a key press is transmitted, the radio remains completely silent, leaving the 2.4 GHz air 100% clear for the opposite half. A slow 3000 ms heartbeat is used only for long holds.
+
+### 4. Central Watchdog Hardening
+- Central PRX no longer executes unilateral channel hopping (`esb_rf_ch_hop()` removed from Central).
+- Watchdog timeout increased to **7000 ms** to eliminate false key-releases during normal typing and modifier chording.
+
+### 5. Hardware Radio FIFO Duplicate Write Fix
+- In `app_esb.c`, `pull_packet_from_tx_msgq()` was refactored to verify that no active transmission is in flight before dequeuing and writing to the hardware FIFO, eliminating duplicate payload writes and preserving strict FIFO ordering.
+
+---
 
 ## What it does
 
