@@ -1,6 +1,14 @@
 # ZMK ESB Split Transport
 
-This is a [ZMK](https://zmk.dev) *Split Transport* module adding support for [Enhanced ShockBurst (ESB)](https://docs.nordicsemi.com/bundle/ncs-latest/page/nrf/protocols/esb/index.html) protocol on Nordic nRF5 Series device.
+> [!WARNING]
+> # 🚨🤖 NOTICE: RECENT COMMITS WRITTEN BY AN LLM (AI) 🤖🚨
+>
+> ## **ALL RECENT FIXES, RF RE-ARCHITECTING, AND COMMITS IN THIS FORK WERE GENERATED AND WRITTEN BY A LARGE LANGUAGE MODEL (LLM / AI ASSISTANT).**
+>
+> ### **USE AT YOUR OWN RISK!**
+> While these changes were engineered to eliminate stuck keys, continuous key repeats, on-air packet collisions, and radio FIFO corruption on a split keyboard (tested on Corne with nice!nano v2 / nRF52840), **THEY ARE AI-GENERATED CODE AND COME WITH ABSOLUTELY NO WARRANTY OR GUARANTEE OF ANY KIND.**
+>
+> **ALWAYS REVIEW THE C SOURCE CODE, DEVICE TREE OVERLAYS, AND KCONFIG SETTINGS CAREFULLY BEFORE FLASHING FIRMWARE TO YOUR OWN HARDWARE!**
 
 This work is based on [zmk,wired-split](https://github.com/zmkfirmware/zmk/tree/main/app/src/split/wired), [nRF Connect SDK > ESB Examples](https://docs.nordicsemi.com/bundle/ncs-2.6.4/page/nrf/samples/esb.html) and [ncs-esb-ble-mpsl-demo](https://github.com/too1/ncs-esb-ble-mpsl-demo/).
 
