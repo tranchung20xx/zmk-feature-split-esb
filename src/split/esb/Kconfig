@@ -56,9 +56,18 @@ config ZMK_SPLIT_ESB_CMD_BUFFER_ITEMS
     int "Number of central commands to buffer for TX/RX"
     default 32
 
+config ZMK_SPLIT_ESB_DEFAULT_RF_CHANNEL
+    int "Default RF channel (2400 MHz + value)"
+    default 76
+    range 2 80
+    help
+      The fixed RF channel used for ESB communication when frequency hopping
+      is disabled. Channel 76 (2476 MHz) is in the quiet guard band above
+      Wi-Fi Channel 11 (2473.5 MHz max) and below BLE Advertising Ch 39 (2480 MHz).
+
 config ZMK_SPLIT_ESB_RF_CH_HOP
     bool "Enable RF channel hopping"
-    default y
+    default n
     help
       When enabled, both TX and RX sides jump to the next
       pre-computed RF channel after TX attempts failure or corrupted

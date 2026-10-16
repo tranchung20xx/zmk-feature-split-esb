@@ -159,9 +159,10 @@ static void idle_reset_work_cb(struct k_work *work) {
 
 static void key_state_work_cb(struct k_work *work) {
     if (any_key_pressed()) {
-        // While keys are held down, send keep-alive every 100ms
+        // Slow keep-alive (3000ms) only when keys are held down long-term.
+        // Never flood the channel during normal typing/chording.
         send_key_state(CONFIG_ZMK_SPLIT_ESB_RETRY_KEY_POSITION);
-        k_work_schedule(&key_state_work, K_MSEC(100));
+        k_work_schedule(&key_state_work, K_MSEC(3000));
         release_confirmed = false;
     } else {
         // All keys are released: send confirmation once more to guarantee delivery
@@ -198,7 +199,7 @@ split_peripheral_esb_report_event(const struct zmk_split_transport_peripheral_ev
 
         if (pressed) {
             release_confirmed = false;
-            k_work_schedule(&key_state_work, K_MSEC(100));
+            k_work_schedule(&key_state_work, K_MSEC(3000));
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP)
             k_work_cancel_delayable(&idle_reset_work);
 #endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP) */

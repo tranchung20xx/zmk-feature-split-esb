@@ -208,7 +208,6 @@ static void process_key_state(uint8_t source, const uint8_t *new_state);
 
 static void watchdog_work_cb(struct k_work *work) {
     int64_t now = k_uptime_get();
-    bool any_peripheral_active = false;
 
     for (uint8_t source = 1; source < MAX_PERIPHERALS; source++) {
         bool has_pressed = false;
@@ -219,31 +218,18 @@ static void watchdog_work_cb(struct k_work *work) {
             }
         }
 
-        if (last_rx_timestamp[source] > 0 && (now - last_rx_timestamp[source] < 3000)) {
-            any_peripheral_active = true;
-        }
-
         if (has_pressed && last_rx_timestamp[source] > 0) {
             int64_t elapsed = now - last_rx_timestamp[source];
-            if (elapsed > 350) {
+            if (elapsed > 7000) {
                 LOG_WRN("Watchdog: Peripheral %d silent for %lld ms with keys pressed! Force releasing all keys.",
                         source, elapsed);
                 uint8_t zero_state[ESB_KEY_STATE_LEN] = {0};
                 process_key_state(source, zero_state);
-#if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP)
-                esb_rf_ch_hop();
-#endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP) */
             }
         }
     }
 
-#if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP)
-    if (!any_peripheral_active) {
-        esb_rf_ch_reset();
-    }
-#endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP) */
-
-    k_work_schedule(&watchdog_work, K_MSEC(100));
+    k_work_schedule(&watchdog_work, K_MSEC(500));
 }
 
 static int zmk_split_esb_central_init(void) {
@@ -387,9 +373,6 @@ static void process_rx_work_cb(struct k_work *work) {
             case -EAGAIN:
                 break;
             case -EINVAL:
-#if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP)
-                esb_rf_ch_hop();
-#endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP) */
                 break;
             default:
                 // LOG_WRN("Issue fetching an item from the RX buffer: %d", item_err);

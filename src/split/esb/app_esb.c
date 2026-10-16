@@ -221,6 +221,8 @@ static int esb_initialize(app_esb_mode_t mode) {
 
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP)
     esb_set_rf_channel(esb_rf_ch[esb_rf_ch_idx]);
+#else
+    esb_set_rf_channel(CONFIG_ZMK_SPLIT_ESB_DEFAULT_RF_CHANNEL);
 #endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP) */
 
     if (err) {
@@ -259,12 +261,14 @@ static int pull_packet_from_tx_msgq(void) {
         return -EBUSY;
     }
 
-    if (!m_has_active_tx) {
-        if (k_msgq_get(&m_msgq_tx_payloads, &m_active_tx_item, K_NO_WAIT) != 0) {
-            return 0; // Empty queue
-        }
-        m_has_active_tx = true;
+    if (m_has_active_tx) {
+        return 0;
     }
+
+    if (k_msgq_get(&m_msgq_tx_payloads, &m_active_tx_item, K_NO_WAIT) != 0) {
+        return 0; // Empty queue
+    }
+    m_has_active_tx = true;
 
     ret = esb_write_payload(&m_active_tx_item.payload);
 
