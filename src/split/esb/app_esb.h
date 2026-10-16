@@ -49,6 +49,7 @@ struct esb_simple_addr {
 
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP)
 uint8_t esb_rf_ch_hop();
+void esb_rf_ch_reset(void);
 #endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP) */
 
 int zmk_split_esb_init(app_esb_mode_t mode, app_esb_callback_t callback);

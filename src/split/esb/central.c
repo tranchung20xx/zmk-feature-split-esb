@@ -198,6 +198,54 @@ static void notify_status_work_cb(struct k_work *_work) { notify_transport_statu
 
 static K_WORK_DEFINE(notify_status_work, notify_status_work_cb);
 
+#define MAX_PERIPHERALS 16
+static uint8_t peripheral_position_state[MAX_PERIPHERALS][ESB_KEY_STATE_LEN];
+
+static struct k_work_delayable watchdog_work;
+static int64_t last_rx_timestamp[MAX_PERIPHERALS];
+
+static void process_key_state(uint8_t source, const uint8_t *new_state);
+
+static void watchdog_work_cb(struct k_work *work) {
+    int64_t now = k_uptime_get();
+    bool any_peripheral_active = false;
+
+    for (uint8_t source = 1; source < MAX_PERIPHERALS; source++) {
+        bool has_pressed = false;
+        for (int i = 0; i < ESB_KEY_STATE_LEN; i++) {
+            if (peripheral_position_state[source][i] != 0) {
+                has_pressed = true;
+                break;
+            }
+        }
+
+        if (last_rx_timestamp[source] > 0 && (now - last_rx_timestamp[source] < 3000)) {
+            any_peripheral_active = true;
+        }
+
+        if (has_pressed && last_rx_timestamp[source] > 0) {
+            int64_t elapsed = now - last_rx_timestamp[source];
+            if (elapsed > 350) {
+                LOG_WRN("Watchdog: Peripheral %d silent for %lld ms with keys pressed! Force releasing all keys.",
+                        source, elapsed);
+                uint8_t zero_state[ESB_KEY_STATE_LEN] = {0};
+                process_key_state(source, zero_state);
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP)
+                esb_rf_ch_hop();
+#endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP) */
+            }
+        }
+    }
+
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP)
+    if (!any_peripheral_active) {
+        esb_rf_ch_reset();
+    }
+#endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP) */
+
+    k_work_schedule(&watchdog_work, K_MSEC(100));
+}
+
 static int zmk_split_esb_central_init(void) {
     for (int i = 0; i < CONFIG_ESB_PIPE_COUNT; i++) {
         ring_buf_init(&rx_bufs[i], RX_RING_BUF_SIZE, rx_bufs_data[i]);
@@ -207,6 +255,8 @@ static int zmk_split_esb_central_init(void) {
         LOG_ERR("zmk_split_esb_init failed (err %d)", ret);
         return ret;
     }
+    k_work_init_delayable(&watchdog_work, watchdog_work_cb);
+    k_work_schedule(&watchdog_work, K_MSEC(100));
     k_work_submit(&notify_status_work);
     return 0;
 }
@@ -214,10 +264,6 @@ static int zmk_split_esb_central_init(void) {
 SYS_INIT(zmk_split_esb_central_init, APPLICATION, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT);
 
 extern const struct zmk_split_transport_central *active_transport;
-
-#define MAX_PERIPHERALS 16
-
-static uint8_t peripheral_position_state[MAX_PERIPHERALS][ESB_KEY_STATE_LEN];
 
 static void process_key_state(uint8_t source, const uint8_t *new_state) {
     if (&esb_central != active_transport) {
@@ -228,31 +274,54 @@ static void process_key_state(uint8_t source, const uint8_t *new_state) {
         return;
     }
 
+    last_rx_timestamp[source] = k_uptime_get();
+
     uint8_t changed[ESB_KEY_STATE_LEN];
     for (int i = 0; i < ESB_KEY_STATE_LEN; i++) {
         changed[i] = new_state[i] ^ peripheral_position_state[source][i];
         peripheral_position_state[source][i] = new_state[i];
     }
 
+    // Pass 1: Process all releases first to prevent stuck modifiers or layer overlap
     for (int i = 0; i < ESB_KEY_STATE_LEN; i++) {
         if (!changed[i]) {
             continue;
         }
         for (int j = 0; j < 8; j++) {
-            if (changed[i] & BIT(j)) {
+            if ((changed[i] & BIT(j)) && !(new_state[i] & BIT(j))) {
                 uint32_t position = (i * 8) + j;
-                bool pressed = (new_state[i] & BIT(j)) != 0;
-
                 struct zmk_split_transport_peripheral_event ev = {
                     .type = ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_KEY_POSITION_EVENT,
                     .data = {
                         .key_position_event = {
                             .position = position,
-                            .pressed = pressed,
+                            .pressed = false,
                         }
                     }
                 };
+                zmk_split_transport_central_peripheral_event_handler(
+                    &esb_central, source, ev);
+            }
+        }
+    }
 
+    // Pass 2: Process all presses
+    for (int i = 0; i < ESB_KEY_STATE_LEN; i++) {
+        if (!changed[i]) {
+            continue;
+        }
+        for (int j = 0; j < 8; j++) {
+            if ((changed[i] & BIT(j)) && (new_state[i] & BIT(j))) {
+                uint32_t position = (i * 8) + j;
+                struct zmk_split_transport_peripheral_event ev = {
+                    .type = ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_KEY_POSITION_EVENT,
+                    .data = {
+                        .key_position_event = {
+                            .position = position,
+                            .pressed = true,
+                        }
+                    }
+                };
                 zmk_split_transport_central_peripheral_event_handler(
                     &esb_central, source, ev);
             }
@@ -273,8 +342,12 @@ static void process_rx_work_cb(struct k_work *work) {
             switch (item_err) {
             case 0: {
                 uint8_t raw_source = env.event_env.payload.source;
+                uint8_t clean_source = raw_source & ~ESB_SOURCE_KEY_STATE_FLAG;
+                if (clean_source < MAX_PERIPHERALS) {
+                    last_rx_timestamp[clean_source] = k_uptime_get();
+                }
+
                 if (raw_source & ESB_SOURCE_KEY_STATE_FLAG) {
-                    uint8_t clean_source = raw_source & ~ESB_SOURCE_KEY_STATE_FLAG;
                     process_key_state(clean_source, env.key_state_env.payload.state);
                 } else {
                     if (&esb_central == active_transport) {

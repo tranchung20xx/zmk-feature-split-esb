@@ -97,6 +97,84 @@ static uint8_t get_retry_count(const struct zmk_split_transport_peripheral_event
     }
 }
 
+static bool any_key_pressed(void) {
+    for (int i = 0; i < ESB_KEY_STATE_LEN; i++) {
+        if (position_state[i] != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int send_key_state(uint8_t retry_count) {
+    struct esb_key_state_envelope env = {
+        .prefix = {
+            .magic_prefix = ZMK_SPLIT_ESB_ENVELOPE_MAGIC_PREFIX,
+            .payload_size = sizeof(struct esb_key_state_payload),
+        },
+        .payload = {
+            .source = peripheral_id | ESB_SOURCE_KEY_STATE_FLAG,
+        },
+    };
+    memcpy(env.payload.state, position_state, ESB_KEY_STATE_LEN);
+
+    size_t evt_env_len = sizeof(env);
+
+    if (ring_buf_space_get(&tx_buf) < ESB_MSG_EXTRA_SIZE + sizeof(env.payload)) {
+        LOG_WRN("No room to send key state event to central");
+        return -ENOSPC;
+    }
+
+    ring_buf_put(&tx_buf, (uint8_t *)&env, evt_env_len);
+
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_MSG_POSTFIX_CRC)
+    struct esb_msg_postfix postfix = {.crc = crc32_ieee((void *)&env, evt_env_len)};
+    ring_buf_put(&tx_buf, (uint8_t *)&postfix, sizeof(postfix));
+#endif
+
+    static uint16_t evt_msg_id = 0;
+    if (++evt_msg_id >= UINT16_MAX - 1000) {
+        evt_msg_id = 1;
+    }
+
+    struct esb_msg_meta meta = {.msg_id = evt_msg_id, .max_retry = retry_count};
+    ring_buf_put(&tx_buf, (uint8_t *)&meta, sizeof(meta));
+
+    begin_tx();
+    return 0;
+}
+
+static struct k_work_delayable key_state_work;
+static bool release_confirmed = true;
+
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP)
+static struct k_work_delayable idle_reset_work;
+
+static void idle_reset_work_cb(struct k_work *work) {
+    if (!any_key_pressed()) {
+        esb_rf_ch_reset();
+    }
+}
+#endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP) */
+
+static void key_state_work_cb(struct k_work *work) {
+    if (any_key_pressed()) {
+        // While keys are held down, send keep-alive every 100ms
+        send_key_state(CONFIG_ZMK_SPLIT_ESB_RETRY_KEY_POSITION);
+        k_work_schedule(&key_state_work, K_MSEC(100));
+        release_confirmed = false;
+    } else {
+        // All keys are released: send confirmation once more to guarantee delivery
+        if (!release_confirmed) {
+            send_key_state(CONFIG_ZMK_SPLIT_ESB_RETRY_KEY_POSITION + 4);
+            release_confirmed = true;
+        }
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP)
+        k_work_schedule(&idle_reset_work, K_MSEC(3000));
+#endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP) */
+    }
+}
+
 static int
 split_peripheral_esb_report_event(const struct zmk_split_transport_peripheral_event *event) {
     if (event->type == ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_KEY_POSITION_EVENT) {
@@ -112,42 +190,26 @@ split_peripheral_esb_report_event(const struct zmk_split_transport_peripheral_ev
             position_state[pos / 8] &= ~BIT(pos % 8);
         }
 
-        struct esb_key_state_envelope env = {
-            .prefix = {
-                .magic_prefix = ZMK_SPLIT_ESB_ENVELOPE_MAGIC_PREFIX,
-                .payload_size = sizeof(struct esb_key_state_payload),
-            },
-            .payload = {
-                .source = peripheral_id | ESB_SOURCE_KEY_STATE_FLAG,
-            },
-        };
-        memcpy(env.payload.state, position_state, ESB_KEY_STATE_LEN);
+        bool pressed = any_key_pressed();
+        uint8_t retries = pressed ? CONFIG_ZMK_SPLIT_ESB_RETRY_KEY_POSITION
+                                  : (CONFIG_ZMK_SPLIT_ESB_RETRY_KEY_POSITION + 4);
 
-        size_t evt_env_len = sizeof(env);
+        send_key_state(retries);
 
-        if (ring_buf_space_get(&tx_buf) < ESB_MSG_EXTRA_SIZE + sizeof(env.payload)) {
-            LOG_WRN("No room to send key state event to central");
-            ring_buf_reset(&tx_buf);
-            return -ENOSPC;
+        if (pressed) {
+            release_confirmed = false;
+            k_work_schedule(&key_state_work, K_MSEC(100));
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP)
+            k_work_cancel_delayable(&idle_reset_work);
+#endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP) */
+        } else {
+            // Schedule release confirmation in 20ms
+            k_work_schedule(&key_state_work, K_MSEC(20));
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP)
+            k_work_schedule(&idle_reset_work, K_MSEC(3000));
+#endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP) */
         }
 
-        ring_buf_put(&tx_buf, (uint8_t *)&env, evt_env_len);
-
-#if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_MSG_POSTFIX_CRC)
-        struct esb_msg_postfix postfix = {.crc = crc32_ieee((void *)&env, evt_env_len)};
-        ring_buf_put(&tx_buf, (uint8_t *)&postfix, sizeof(postfix));
-#endif
-
-        static uint16_t evt_msg_id = 0;
-        if (++evt_msg_id >= UINT16_MAX - 1000) {
-            evt_msg_id = 1;
-        }
-
-        uint8_t max_retry = CONFIG_ZMK_SPLIT_ESB_RETRY_KEY_POSITION;
-        struct esb_msg_meta meta = {.msg_id = evt_msg_id, .max_retry = max_retry};
-        ring_buf_put(&tx_buf, (uint8_t *)&meta, sizeof(meta));
-
-        begin_tx();
         return 0;
     }
 
@@ -267,6 +329,10 @@ static int zmk_split_esb_peripheral_init(void) {
         LOG_ERR("zmk_split_esb_init failed (ret %d)", ret);
         return ret;
     }
+    k_work_init_delayable(&key_state_work, key_state_work_cb);
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP)
+    k_work_init_delayable(&idle_reset_work, idle_reset_work_cb);
+#endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_RF_CH_HOP) */
     k_work_submit(&notify_status_work);
     return 0;
 }
